@@ -1,0 +1,23 @@
+# Environment & Secrets
+.env
+.env.local
+cookies/cookies.txt
+*.cookies
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+env/
+venv/
+ENV/
+
+# Caches & Logs
+cache/audio/*
+!cache/audio/.gitkeep
+logs/*
+!logs/.gitkeep
+*.log
+*.tmp

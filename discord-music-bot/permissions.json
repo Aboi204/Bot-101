@@ -1,0 +1,33 @@
+{
+  "permissions": {
+    "allow": [
+      "command(*)",
+      "unsandboxed(*)",
+      "read_file(*)",
+      "write_file(*)",
+      "read_url(*)",
+      "execute_url(*)",
+      "mcp(*)",
+      "localhost",
+      "google.com",
+      "accounts.google.com",
+      "drive.google.com",
+      "youtube.com",
+      "youtu.be",
+      "facebook.com",
+      "fb.watch",
+      "soundcloud.com",
+      "telegram.org",
+      "my.telegram.org",
+      "web.telegram.org",
+      "t.me",
+      "discord.com",
+      "github.com",
+      "wispbyte.com",
+      "koyeb.com",
+      "uptimerobot.com"
+    ],
+    "ask": [],
+    "deny": []
+  }
+}

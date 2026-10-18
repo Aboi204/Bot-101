@@ -1,0 +1,15 @@
+version: '3.8'
+
+services:
+  discord-music-bot:
+    build: .
+    container_name: free-discord-music-bot
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    env_file:
+      - .env
+    volumes:
+      - ./logs:/app/logs
+      - ./cookies:/app/cookies
+      - ./cache/audio:/app/cache/audio
