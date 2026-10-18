@@ -41,7 +41,7 @@ class GuildVoiceManager:
 
     FFMPEG_OPTIONS = {
         'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin -user_agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"',
-        'options': '-vn'
+        'options': '-vn -filter:a volume=2.2,alimiter=limit=0.98'
     }
 
     def __init__(self, bot: discord.Client, guild: discord.Guild, resolver: UnifiedAudioResolver):
