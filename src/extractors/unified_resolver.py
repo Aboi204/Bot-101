@@ -1,4 +1,5 @@
 import asyncio
+import html
 import os
 import re
 import urllib.parse
@@ -50,7 +51,7 @@ class UnifiedAudioResolver:
     YOUTUBE_VIDEO_RE = re.compile(r'(?:v=|/shorts/|youtu\.be/)([a-zA-Z0-9_-]{11})')
     FACEBOOK_RE = re.compile(r"https?://(?:www\.|m\.|web\.)?(?:facebook\.com|fb\.watch|fb\.me|fb\.com)/.+")
     SOUNDCLOUD_RE = re.compile(r"https?://(?:www\.)?soundcloud\.com/[\w\-_]+/[\w\-_]+")
-    TELEGRAM_RE = re.compile(r"https?://(?:www\.)?t\.me/([a-zA-Z0-9_]+)/([0-9]+)")
+    TELEGRAM_RE = re.compile(r"https?://(?:www\.)?(?:t\.me|telegram\.me)/(?:s/|joinchat/|\+)?(?:c/([0-9]+)|([a-zA-Z0-9_+-]+))/([0-9]+)")
     GDRIVE_RE = re.compile(r"https?://drive\.google\.com/(?:file/d/([a-zA-Z0-9_-]+)|open\?id=([a-zA-Z0-9_-]+)|uc\?id=([a-zA-Z0-9_-]+))")
 
     def __init__(self):
@@ -238,6 +239,7 @@ class UnifiedAudioResolver:
         loop = asyncio.get_running_loop()
         opts = self._build_ytdl_opts("telegram", noplaylist=True)
 
+        # 1. Attempt native yt-dlp extraction
         def _extract():
             with yt_dlp.YoutubeDL(opts) as ydl:
                 return ydl.extract_info(url, download=False)
@@ -245,49 +247,125 @@ class UnifiedAudioResolver:
         try:
             info = await loop.run_in_executor(None, _extract)
             if info and info.get('url'):
+                raw_title = info.get('title') or 'Telegram Audio Stream'
+                uploader = info.get('uploader') or 'Telegram Channel'
                 return [ResolvedTrack(
-                    title=info.get('title', 'Telegram Audio Stream'),
+                    title=raw_title,
                     webpage_url=info.get('webpage_url', url),
                     stream_url=info['url'],
                     duration=int(info.get('duration', 0) or 0),
                     thumbnail=info.get('thumbnail'),
-                    uploader=info.get('uploader', 'Telegram Channel'),
+                    uploader=uploader,
                     source_platform="telegram",
                     trace_id=trace_id
                 )]
         except Exception as e:
             log.warning(f"Telegram native extraction failed, attempting embed parsing: {e}")
 
-        # Fallback to web embed
+        # 2. Advanced Multi-Candidate Embed & Web Channel Fallback
         match = self.TELEGRAM_RE.search(url)
-        if not match:
-            raise ValueError(f"Invalid Telegram URL: {url}")
-        channel, msg_id = match.group(1), match.group(2)
-        embed_url = f"https://t.me/{channel}/{msg_id}?embed=1"
-        headers = {"User-Agent": "Mozilla/5.0"}
+        channel = (match.group(1) or match.group(2)) if match else None
+        msg_id = match.group(3) if match else None
+
+        if not channel or not msg_id:
+            parts = [p for p in url.split('?')[0].split('/') if p]
+            if len(parts) >= 2 and parts[-1].isdigit():
+                msg_id = parts[-1]
+                channel = parts[-2].lstrip('+')
+
+        if not channel or not msg_id:
+            raise ValueError(f"Could not extract channel name and post ID from Telegram URL: {url}")
+
+        clean_channel = channel.lstrip('+')
+        candidates = [
+            f"https://t.me/{clean_channel}/{msg_id}?embed=1",
+            f"https://t.me/s/{clean_channel}/{msg_id}",
+            f"https://t.me/{clean_channel}/{msg_id}",
+        ]
+        if match and match.group(1):  # c/<channel_id>/<msg_id> format
+            candidates.insert(0, f"https://t.me/c/{clean_channel}/{msg_id}?embed=1")
+
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "ar,en-US;q=0.9,en;q=0.8"
+        }
+
         async with aiohttp.ClientSession(headers=headers) as session:
-            async with session.get(embed_url) as resp:
-                if resp.status != 200:
-                    raise ConnectionError(f"HTTP {resp.status} on Telegram embed")
-                html = await resp.text()
+            for cand_url in candidates:
+                try:
+                    async with session.get(cand_url, timeout=aiohttp.ClientTimeout(total=8)) as resp:
+                        if resp.status != 200:
+                            continue
+                        html_text = await resp.text()
 
-        media_match = re.search(r'<(?:audio|video)[^>]+src=["\']([^"\']+)["\']', html)
-        if media_match:
-            src = media_match.group(1)
-            if src.startswith("/"):
-                src = f"https://t.me{src}"
-            return [ResolvedTrack(
-                title=f"Telegram Audio ({channel}/{msg_id})",
-                webpage_url=url,
-                stream_url=src,
-                duration=0,
-                thumbnail=None,
-                uploader=f"@{channel}",
-                source_platform="telegram",
-                trace_id=trace_id
-            )]
+                        # Extract media source from video/audio/source tags or telescope links
+                        media_matches = re.findall(r'<(?:audio|video|source)[^>]+src=["\']([^"\']+)["\']', html_text)
+                        if not media_matches:
+                            media_matches = re.findall(
+                                r'https?://[a-zA-Z0-9_\.]*telesco\.pe/file/[^\s"\'<>]+\.(?:mp4|mp3|ogg|m4a|wav|opus)[^\s"\'<>]*',
+                                html_text
+                            )
 
-        raise ValueError(f"Could not locate playable audio in Telegram URL: {url}")
+                        if media_matches:
+                            stream_src = media_matches[0]
+                            if stream_src.startswith("/"):
+                                stream_src = f"https://t.me{stream_src}"
+
+                            # Extract channel owner / uploader name
+                            author_match = re.search(
+                                r'class=["\']tgme_widget_message_owner_name[^\"]*["\'][^>]*><span[^>]*>(.*?)</span>',
+                                html_text,
+                                re.DOTALL
+                            )
+                            author = html.unescape(re.sub(r'<[^>]+>', '', author_match.group(1)).strip()) if author_match else f"@{clean_channel}"
+
+                            # Extract caption/text
+                            caption_match = re.search(
+                                r'class=["\']tgme_widget_message_text[^\"]*["\'][^>]*>(.*?)</div>',
+                                html_text,
+                                re.DOTALL
+                            )
+                            caption = html.unescape(re.sub(r'<[^>]+>', '', caption_match.group(1)).strip()) if caption_match else None
+
+                            # Extract duration
+                            dur_match = re.search(r'class=["\']message_video_duration[^\"]*["\'][^>]*>([0-9:]+)</time>', html_text)
+                            duration = 0
+                            if dur_match:
+                                parts = list(map(int, dur_match.group(1).split(':')))
+                                if len(parts) == 2:
+                                    duration = parts[0] * 60 + parts[1]
+                                elif len(parts) == 3:
+                                    duration = parts[0] * 3600 + parts[1] * 60 + parts[2]
+
+                            # Extract thumbnail
+                            thumb_match = re.search(
+                                r'class=["\'][^"\']*(?:video_thumb|photo_thumb)[^"\']*["\'][^>]*style=["\']background-image:url\([\'"]?([^\'")]+)[\'"]?\)',
+                                html_text
+                            )
+                            thumbnail = thumb_match.group(1) if thumb_match else None
+
+                            title = caption if caption else f"{author} #{msg_id}"
+
+                            return [ResolvedTrack(
+                                title=title,
+                                webpage_url=url,
+                                stream_url=stream_src,
+                                duration=duration,
+                                thumbnail=thumbnail,
+                                uploader=author,
+                                source_platform="telegram",
+                                trace_id=trace_id
+                            )]
+                except Exception as ex:
+                    log.debug(f"Telegram candidate {cand_url} failed: {ex}")
+                    continue
+
+        raise ValueError(
+            f"مقطع تيليجرام ({clean_channel}/{msg_id}) غير متاح للبث المباشر عبر المعاينة العامة. "
+            f"قد يكون المقطع بتنسيق غير مدعوم على متصفح الويب أو يتجاوز الحجم المسموح. "
+            f"جرب مقطعاً آخر من القناة متاحاً للمعاينة (مثل #{int(msg_id) + 1 if msg_id.isdigit() else 'المقاطع الأخرى'})."
+        )
 
     @trace_and_log(platform_name="google_drive", extract_url_arg="url")
     async def resolve_gdrive(self, url: str, trace_id: str) -> List[ResolvedTrack]:
@@ -325,7 +403,7 @@ class UnifiedAudioResolver:
             return await self.resolve_facebook(query_or_url, trace_id=trace_id)
         elif self.SOUNDCLOUD_RE.search(query_or_url):
             return await self.resolve_soundcloud(query_or_url, trace_id=trace_id)
-        elif self.TELEGRAM_RE.search(query_or_url):
+        elif self.TELEGRAM_RE.search(query_or_url) or "t.me/" in query_or_url or "telegram.me/" in query_or_url:
             return await self.resolve_telegram(query_or_url, trace_id=trace_id)
         elif self.GDRIVE_RE.search(query_or_url):
             return await self.resolve_gdrive(query_or_url, trace_id=trace_id)
