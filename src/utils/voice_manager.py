@@ -89,6 +89,24 @@ class GuildVoiceManager:
             elapsed = time.time() - self.track_start_time - self.total_paused_duration
         return max(0, int(elapsed))
 
+    def enqueue(self, track: ResolvedTrack):
+        """Adds a single track to the queue and triggers playback if idle."""
+        self.queue.append(track)
+        self.start_worker()
+        self._check_and_trigger_playback()
+
+    def enqueue_multiple(self, tracks: list[ResolvedTrack]):
+        """Adds multiple tracks to the queue and triggers playback if idle."""
+        for track in tracks:
+            self.queue.append(track)
+        self.start_worker()
+        self._check_and_trigger_playback()
+
+    def _check_and_trigger_playback(self):
+        """Signals the playback dispatcher loop if no audio is actively streaming."""
+        if not self.is_playing and not self.is_paused:
+            self.play_next_event.set()
+
     def start_worker(self):
         if not self.worker_task or self.worker_task.done():
             self.worker_task = asyncio.create_task(self._playback_loop())
@@ -139,6 +157,8 @@ class GuildVoiceManager:
     async def _stream_track(self, track: ResolvedTrack, seek_seconds: int = 0):
         if not self.voice_client or not self.voice_client.is_connected():
             log.warning(f"Voice client not connected in guild {self.guild.id}")
+            self.current = None
+            self.play_next_event.set()
             return
 
         try:
@@ -255,11 +275,15 @@ class GuildVoiceManager:
 
     def stop(self):
         self.is_recovering = False
+        if self.current:
+            self.history.append(self.current)
         self.queue.clear()
         self.current = None
         self.loop_mode = LoopMode.OFF
         if self.voice_client and (self.voice_client.is_playing() or self.voice_client.is_paused()):
             self.voice_client.stop()
+        else:
+            self.play_next_event.set()
 
     def set_volume(self, vol_percent: int):
         self.volume = max(0.01, min(vol_percent / 100.0, 2.0))

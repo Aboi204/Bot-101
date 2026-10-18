@@ -45,6 +45,12 @@ class MusicCog(commands.Cog, name="Music"):
 
         if vc is None:
             vc = await channel.connect()
+        elif not vc.is_connected():
+            try:
+                await vc.disconnect(force=True)
+            except Exception:
+                pass
+            vc = await channel.connect()
         elif vc.channel != channel:
             await vc.move_to(channel)
 
@@ -74,10 +80,7 @@ class MusicCog(commands.Cog, name="Music"):
             await interaction.followup.send(f"❌ No playable audio streams found.\nTrace-ID: `{trace_id}`")
             return
 
-        for track in tracks:
-            manager.queue.append(track)
-
-        manager.start_worker()
+        manager.enqueue_multiple(tracks)
 
         if len(tracks) == 1:
             track = tracks[0]
