@@ -19,20 +19,7 @@ from src.utils.logger import (
     trace_and_log,
 )
 from src.utils.voice_manager import GuildVoiceManager, LoopMode
-
-def create_progress_bar(elapsed_sec: int, total_sec: int, bar_length: int = 16) -> str:
-    if total_sec <= 0:
-        return "🔘" + ("─" * bar_length) + " Live / Unknown"
-    progress = min(1.0, max(0.0, elapsed_sec / total_sec))
-    filled_blocks = int(round(progress * bar_length))
-    bar = "─" * filled_blocks + "🔘" + "─" * (bar_length - filled_blocks)
-
-    def fmt(s: int) -> str:
-        m, sec = divmod(s, 60)
-        h, m = divmod(m, 60)
-        return f"{h}:{m:02d}:{sec:02d}" if h > 0 else f"{m:02d}:{sec:02d}"
-
-    return f"`{bar}` {fmt(elapsed_sec)} / {fmt(total_sec)}"
+from src.utils.ui_controls import MusicControlView, build_now_playing_embed, create_progress_bar
 
 class MusicCog(commands.Cog, name="Music"):
     """Multi-source music streaming commands and diagnostic telemetry."""
@@ -102,7 +89,7 @@ class MusicCog(commands.Cog, name="Music"):
             embed.add_field(name="Source", value=track.source_platform.replace("_", " ").title(), inline=True)
             embed.add_field(name="Duration", value=track.formatted_duration, inline=True)
             embed.add_field(name="Position in Queue", value=str(len(manager.queue)), inline=True)
-            embed.set_footer(text=f"Trace-ID: {trace_id}")
+            embed.set_footer(text=f"Trace-ID: {trace_id} • Fast Direct Streaming")
             if track.thumbnail:
                 embed.set_thumbnail(url=track.thumbnail)
             await interaction.followup.send(embed=embed)
@@ -149,59 +136,27 @@ class MusicCog(commands.Cog, name="Music"):
         manager.stop()
         await interaction.response.send_message("⏹️ Playback stopped and queue cleared.")
 
-    @app_commands.command(name="nowplaying", description="Show detailed info and dynamic progress of current song")
+    @app_commands.command(name="nowplaying", description="Show detailed info and dynamic controls of current song")
     async def nowplaying(self, interaction: discord.Interaction):
         manager = self.get_manager(interaction.guild)
         if not manager.current:
             await interaction.response.send_message("❌ Nothing is currently playing.", ephemeral=True)
             return
 
-        track = manager.current
-        elapsed = manager.elapsed_seconds
-        progress_bar = create_progress_bar(elapsed, track.duration)
+        embed = build_now_playing_embed(manager)
+        view = MusicControlView(manager)
+        await interaction.response.send_message(embed=embed, view=view)
 
-        embed = discord.Embed(
-            title="Now Playing",
-            description=f"[{track.title}]({track.webpage_url})\n\n{progress_bar}",
-            color=discord.Color.blurple()
-        )
-        embed.add_field(name="Platform", value=track.source_platform.replace("_", " ").title(), inline=True)
-        embed.add_field(name="Uploader", value=track.uploader, inline=True)
-        embed.add_field(name="Loop Mode", value=manager.loop_mode.value.title(), inline=True)
-        embed.add_field(name="Volume", value=f"{int(manager.volume * 100)}%", inline=True)
-        embed.set_footer(text=f"Trace-ID: {track.trace_id}")
-        if track.thumbnail:
-            embed.set_thumbnail(url=track.thumbnail)
-
-        await interaction.response.send_message(embed=embed)
-
-    @app_commands.command(name="queue", description="Display the list of upcoming songs in the queue")
+    @app_commands.command(name="queue", description="Display the list of upcoming songs with interactive controls")
     async def queue_cmd(self, interaction: discord.Interaction):
         manager = self.get_manager(interaction.guild)
         if not manager.current and not manager.queue:
             await interaction.response.send_message("📭 Queue is currently empty.", ephemeral=True)
             return
 
-        embed = discord.Embed(title=f"Queue for {interaction.guild.name}", color=discord.Color.blue())
-        if manager.current:
-            embed.add_field(
-                name="🎶 Currently Playing",
-                value=f"[{manager.current.title}]({manager.current.webpage_url}) (`{manager.current.formatted_duration}`)",
-                inline=False
-            )
-
-        if manager.queue:
-            items = []
-            for idx, track in enumerate(list(manager.queue)[:10], start=1):
-                items.append(f"`{idx}.` [{track.title}]({track.webpage_url}) - `{track.formatted_duration}`")
-            queue_text = "\n".join(items)
-            if len(manager.queue) > 10:
-                queue_text += f"\n*...and {len(manager.queue) - 10} more*"
-            embed.add_field(name=f"Upcoming Tracks ({len(manager.queue)})", value=queue_text, inline=False)
-        else:
-            embed.add_field(name="Upcoming Tracks", value="No further tracks enqueued.", inline=False)
-
-        await interaction.response.send_message(embed=embed)
+        embed = build_now_playing_embed(manager)
+        view = MusicControlView(manager)
+        await interaction.response.send_message(embed=embed, view=view)
 
     @app_commands.command(name="volume", description="Set playback volume between 1% and 200%")
     @app_commands.describe(percent="Volume percentage (1-200)")
