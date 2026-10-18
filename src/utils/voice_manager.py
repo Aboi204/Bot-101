@@ -1,5 +1,6 @@
 import asyncio
 import os
+import shutil
 import time
 from collections import deque
 from enum import Enum
@@ -13,6 +14,18 @@ from src.utils.logger import log, record_error_trace
 
 IDLE_TIMEOUT_SECONDS = 300  # 5 minutes
 
+def get_ffmpeg_executable() -> str:
+    which_ffmpeg = shutil.which("ffmpeg")
+    if which_ffmpeg:
+        return which_ffmpeg
+
+    # Windows winget fallback path
+    win_path = Path(r"C:\Users\ISLAM\AppData\Local\Microsoft\WinGet\Packages\Gyan.FFmpeg_Microsoft.Winget.Source_8wekyb3d8bbwe\ffmpeg-9.0.2-full_build\bin\ffmpeg.exe")
+    if win_path.exists():
+        return str(win_path)
+
+    return "ffmpeg"
+
 class LoopMode(Enum):
     OFF = "off"
     TRACK = "track"
@@ -21,11 +34,11 @@ class LoopMode(Enum):
 class GuildVoiceManager:
     """
     Manages queue, playback, voice watchdog self-healing with -ss dynamic resume,
-    and cache cleanup for a single Discord guild.
+    and direct low-latency audio streaming for a single Discord guild.
     """
 
     FFMPEG_OPTIONS = {
-        'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin',
+        'before_options': '-reconnect 1 -reconnect_streamed 1 -reconnect_delay_max 5 -nostdin -user_agent "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"',
         'options': '-vn'
     }
 
@@ -39,6 +52,7 @@ class GuildVoiceManager:
         self.volume: float = 0.5
         self.voice_client: Optional[discord.VoiceClient] = None
         self.text_channel: Optional[discord.TextChannel] = None
+        self.ffmpeg_executable = get_ffmpeg_executable()
 
         self.play_next_event = asyncio.Event()
         self.worker_task: Optional[asyncio.Task] = None
@@ -97,6 +111,16 @@ class GuildVoiceManager:
                 continue
 
             self._cancel_idle_timer()
+
+            # If placeholder URL from playlist, resolve actual stream URL just-in-time
+            if next_track.stream_url.startswith("https://www.youtube.com/watch?v=") and "googlevideo.com" not in next_track.stream_url:
+                try:
+                    resolved_list = await self.resolver.resolve_youtube(next_track.stream_url, trace_id=next_track.trace_id)
+                    if resolved_list:
+                        next_track = resolved_list[0]
+                except Exception as e:
+                    log.error(f"Failed to resolve placeholder track: {e}")
+
             self.current = next_track
             await self._stream_track(next_track, seek_seconds=self.elapsed_seconds if self.is_recovering else 0)
             self.is_recovering = False
@@ -113,8 +137,10 @@ class GuildVoiceManager:
             if seek_seconds > 0:
                 before_opts = f"-ss {seek_seconds} " + before_opts
 
+            # Low latency direct stream pipe
             raw_source = discord.FFmpegPCMAudio(
                 track.stream_url,
+                executable=self.ffmpeg_executable,
                 before_options=before_opts,
                 options=self.FFMPEG_OPTIONS['options']
             )
@@ -128,7 +154,6 @@ class GuildVoiceManager:
             def _after_stream(error):
                 if error:
                     log.error(f"FFmpeg stream interrupted on {track.title}: {error}", extra={"trace_id": track.trace_id, "guild_id": self.guild.id})
-                    # Attempt autonomous self-healing if under 3 retries
                     if self.retry_count < 3 and self.elapsed_seconds < (track.duration or 3600) - 5:
                         self.retry_count += 1
                         self.is_recovering = True
@@ -154,7 +179,7 @@ class GuildVoiceManager:
                 embed.add_field(name="Platform", value=track.source_platform.replace("_", " ").title(), inline=True)
                 embed.add_field(name="Duration", value=track.formatted_duration, inline=True)
                 embed.add_field(name="Uploader", value=track.uploader, inline=True)
-                embed.set_footer(text=f"Trace-ID: {track.trace_id}")
+                embed.set_footer(text=f"Trace-ID: {track.trace_id} • Fast Direct Streaming")
                 if track.thumbnail:
                     embed.set_thumbnail(url=track.thumbnail)
                 asyncio.create_task(self.text_channel.send(embed=embed))
@@ -172,7 +197,7 @@ class GuildVoiceManager:
             self.play_next_event.set()
 
     def _cleanup_track_cache(self, track: ResolvedTrack):
-        """Removes temporary cached audio files (Telegram, etc.) post-playback."""
+        """Removes temporary cached audio files post-playback."""
         if track.is_local_file and track.local_file_path and os.path.exists(track.local_file_path):
             try:
                 os.remove(track.local_file_path)
