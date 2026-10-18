@@ -42,15 +42,14 @@ class UnifiedAudioResolver:
     Unified multi-source audio resolver optimized for instant direct streaming.
     1. YouTube (Instant single-video resolution, radio/mix cleanup, flat playlist fallback)
     2. SoundCloud
-    3. Facebook
+    3. Facebook (HD Audio quality direct streaming)
     4. Telegram
     5. Google Drive
     """
 
     YOUTUBE_VIDEO_RE = re.compile(r'(?:v=|/shorts/|youtu\.be/)([a-zA-Z0-9_-]{11})')
-    YOUTUBE_PLAYLIST_RE = re.compile(r'[?&]list=([a-zA-Z0-9_-]+)')
+    FACEBOOK_RE = re.compile(r"https?://(?:www\.|m\.|web\.)?(?:facebook\.com|fb\.watch|fb\.me|fb\.com)/.+")
     SOUNDCLOUD_RE = re.compile(r"https?://(?:www\.)?soundcloud\.com/[\w\-_]+/[\w\-_]+")
-    FACEBOOK_RE = re.compile(r"https?://(?:www\.|m\.|web\.)?(?:facebook\.com|fb\.watch)/.+")
     TELEGRAM_RE = re.compile(r"https?://(?:www\.)?t\.me/([a-zA-Z0-9_]+)/([0-9]+)")
     GDRIVE_RE = re.compile(r"https?://drive\.google\.com/(?:file/d/([a-zA-Z0-9_-]+)|open\?id=([a-zA-Z0-9_-]+)|uc\?id=([a-zA-Z0-9_-]+))")
 
@@ -77,104 +76,134 @@ class UnifiedAudioResolver:
         if self.cookie_path and os.path.exists(self.cookie_path) and os.path.getsize(self.cookie_path) > 100:
             opts['cookiefile'] = self.cookie_path
 
-        if platform_type in ("facebook", "telegram", "gdrive"):
+        if platform_type == "facebook":
+            # HD video audio stream selection for crystal-clear quality
+            opts['format'] = 'hd/best[ext=mp4]/bestaudio/best'
+        elif platform_type in ("telegram", "gdrive"):
             opts['format'] = 'best[ext=mp4]/bestaudio/best'
         return opts
+
+    @trace_and_log(platform_name="facebook", extract_url_arg="url")
+    async def resolve_facebook(self, url: str, trace_id: str) -> List[ResolvedTrack]:
+        loop = asyncio.get_running_loop()
+        opts = self._build_ytdl_opts("facebook", noplaylist=True)
+
+        def _extract():
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(url, download=False)
+
+        info = await loop.run_in_executor(None, _extract)
+        if not info or not info.get('url'):
+            raise ValueError(f"Could not extract playable stream from Facebook URL: {url}")
+
+        raw_title = info.get('title') or 'Facebook Video Audio'
+        # Clean title if it contains reaction headers like '290K views · 8.6K reactions | ...'
+        if "|" in raw_title:
+            clean_title = raw_title.split("|", 1)[1].strip()
+        else:
+            clean_title = raw_title
+
+        return [ResolvedTrack(
+            title=clean_title[:100],
+            webpage_url=info.get('webpage_url', url),
+            stream_url=info['url'],
+            duration=int(info.get('duration', 0) or 0),
+            thumbnail=info.get('thumbnail'),
+            uploader=info.get('uploader', 'Facebook'),
+            source_platform="facebook",
+            trace_id=trace_id
+        )]
 
     @trace_and_log(platform_name="youtube", extract_url_arg="url_or_query")
     async def resolve_youtube(self, url_or_query: str, trace_id: str) -> List[ResolvedTrack]:
         loop = asyncio.get_running_loop()
 
-        # Check if the URL contains a specific YouTube video ID
-        v_match = self.YOUTUBE_VIDEO_RE.search(url_or_query)
-        if v_match:
-            video_id = v_match.group(1)
-            # Strip radio mix, playlist params, timestamps to isolate the video and make extraction INSTANT
-            clean_target = f"https://www.youtube.com/watch?v={video_id}"
-            opts = self._build_ytdl_opts("youtube", noplaylist=True)
+        # Check if URL contains YouTube video ID (watch?v=, youtu.be/, shorts/)
+        if ("youtube.com" in url_or_query or "youtu.be" in url_or_query):
+            v_match = self.YOUTUBE_VIDEO_RE.search(url_or_query)
+            if v_match:
+                video_id = v_match.group(1)
+                clean_target = f"https://www.youtube.com/watch?v={video_id}"
+                opts = self._build_ytdl_opts("youtube", noplaylist=True)
 
-            def _extract_single():
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    return ydl.extract_info(clean_target, download=False)
+                def _extract_single():
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        return ydl.extract_info(clean_target, download=False)
 
-            info = await loop.run_in_executor(None, _extract_single)
-            if not info or not info.get('url'):
-                raise ValueError(f"Could not extract direct stream URL for YouTube video: {clean_target}")
+                info = await loop.run_in_executor(None, _extract_single)
+                if not info or not info.get('url'):
+                    raise ValueError(f"Could not extract direct stream URL for YouTube video: {clean_target}")
 
-            return [ResolvedTrack(
-                title=info.get('title', 'YouTube Audio'),
-                webpage_url=clean_target,
-                stream_url=info['url'],
-                duration=int(info.get('duration', 0) or 0),
-                thumbnail=info.get('thumbnail'),
-                uploader=info.get('uploader', 'YouTube Uploader'),
-                source_platform="youtube",
-                trace_id=trace_id
-            )]
-
-        # If it's a pure playlist without a video ID
-        elif "list=" in url_or_query and ("youtube.com" in url_or_query or "youtu.be" in url_or_query):
-            # Extract flat to get tracklist instantly without resolving all streams upfront
-            opts = self._build_ytdl_opts("youtube", noplaylist=False)
-            opts['extract_flat'] = 'in_playlist'
-
-            def _extract_playlist():
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    return ydl.extract_info(url_or_query, download=False)
-
-            info = await loop.run_in_executor(None, _extract_playlist)
-            entries = info.get('entries', [])
-            if not entries:
-                raise ValueError("No entries found in YouTube playlist.")
-
-            # Resolve the first track immediately so streaming starts instantly
-            first_entry = entries[0]
-            first_url = first_entry.get('url') or f"https://www.youtube.com/watch?v={first_entry.get('id')}"
-            first_track_list = await self.resolve_youtube(first_url, trace_id=trace_id)
-            tracks = list(first_track_list)
-
-            # Queue remaining tracks as placeholder entries that resolve on-demand
-            for entry in entries[1:25]:  # Cap at 25 for fast response
-                e_id = entry.get('id')
-                if not e_id:
-                    continue
-                tracks.append(ResolvedTrack(
-                    title=entry.get('title', 'Queued Video'),
-                    webpage_url=f"https://www.youtube.com/watch?v={e_id}",
-                    stream_url=f"https://www.youtube.com/watch?v={e_id}",  # will resolve just-in-time
-                    duration=int(entry.get('duration', 0) or 0),
-                    thumbnail=None,
-                    uploader=entry.get('uploader', 'YouTube'),
+                return [ResolvedTrack(
+                    title=info.get('title', 'YouTube Audio'),
+                    webpage_url=clean_target,
+                    stream_url=info['url'],
+                    duration=int(info.get('duration', 0) or 0),
+                    thumbnail=info.get('thumbnail'),
+                    uploader=info.get('uploader', 'YouTube Uploader'),
                     source_platform="youtube",
                     trace_id=trace_id
-                ))
-            return tracks
+                )]
+
+            # Pure playlist link
+            elif "list=" in url_or_query:
+                opts = self._build_ytdl_opts("youtube", noplaylist=False)
+                opts['extract_flat'] = 'in_playlist'
+
+                def _extract_playlist():
+                    with yt_dlp.YoutubeDL(opts) as ydl:
+                        return ydl.extract_info(url_or_query, download=False)
+
+                info = await loop.run_in_executor(None, _extract_playlist)
+                entries = info.get('entries', [])
+                if not entries:
+                    raise ValueError("No entries found in YouTube playlist.")
+
+                first_entry = entries[0]
+                first_url = first_entry.get('url') or f"https://www.youtube.com/watch?v={first_entry.get('id')}"
+                first_track_list = await self.resolve_youtube(first_url, trace_id=trace_id)
+                tracks = list(first_track_list)
+
+                for entry in entries[1:25]:
+                    e_id = entry.get('id')
+                    if not e_id:
+                        continue
+                    tracks.append(ResolvedTrack(
+                        title=entry.get('title', 'Queued Video'),
+                        webpage_url=f"https://www.youtube.com/watch?v={e_id}",
+                        stream_url=f"https://www.youtube.com/watch?v={e_id}",
+                        duration=int(entry.get('duration', 0) or 0),
+                        thumbnail=None,
+                        uploader=entry.get('uploader', 'YouTube'),
+                        source_platform="youtube",
+                        trace_id=trace_id
+                    ))
+                return tracks
 
         # Natural language search query
-        else:
-            target = f"ytsearch1:{url_or_query}"
-            opts = self._build_ytdl_opts("youtube", noplaylist=True)
+        target = f"ytsearch1:{url_or_query}"
+        opts = self._build_ytdl_opts("youtube", noplaylist=True)
 
-            def _extract_search():
-                with yt_dlp.YoutubeDL(opts) as ydl:
-                    return ydl.extract_info(target, download=False)
+        def _extract_search():
+            with yt_dlp.YoutubeDL(opts) as ydl:
+                return ydl.extract_info(target, download=False)
 
-            info = await loop.run_in_executor(None, _extract_search)
-            entries = info.get('entries') if info and 'entries' in info else [info]
-            if not entries or not entries[0] or not entries[0].get('url'):
-                raise ValueError(f"No search results found for query: {url_or_query}")
+        info = await loop.run_in_executor(None, _extract_search)
+        entries = info.get('entries') if info and 'entries' in info else [info]
+        if not entries or not entries[0] or not entries[0].get('url'):
+            raise ValueError(f"No search results found for query: {url_or_query}")
 
-            entry = entries[0]
-            return [ResolvedTrack(
-                title=entry.get('title', 'YouTube Audio'),
-                webpage_url=entry.get('webpage_url', entry.get('original_url', target)),
-                stream_url=entry['url'],
-                duration=int(entry.get('duration', 0) or 0),
-                thumbnail=entry.get('thumbnail'),
-                uploader=entry.get('uploader', 'YouTube Uploader'),
-                source_platform="youtube",
-                trace_id=trace_id
-            )]
+        entry = entries[0]
+        return [ResolvedTrack(
+            title=entry.get('title', 'YouTube Audio'),
+            webpage_url=entry.get('webpage_url', entry.get('original_url', target)),
+            stream_url=entry['url'],
+            duration=int(entry.get('duration', 0) or 0),
+            thumbnail=entry.get('thumbnail'),
+            uploader=entry.get('uploader', 'YouTube Uploader'),
+            source_platform="youtube",
+            trace_id=trace_id
+        )]
 
     @trace_and_log(platform_name="soundcloud", extract_url_arg="url_or_query")
     async def resolve_soundcloud(self, url_or_query: str, trace_id: str) -> List[ResolvedTrack]:
@@ -203,30 +232,6 @@ class UnifiedAudioResolver:
                 trace_id=trace_id
             ))
         return tracks
-
-    @trace_and_log(platform_name="facebook", extract_url_arg="url")
-    async def resolve_facebook(self, url: str, trace_id: str) -> List[ResolvedTrack]:
-        loop = asyncio.get_running_loop()
-        opts = self._build_ytdl_opts("facebook", noplaylist=True)
-
-        def _extract():
-            with yt_dlp.YoutubeDL(opts) as ydl:
-                return ydl.extract_info(url, download=False)
-
-        info = await loop.run_in_executor(None, _extract)
-        if not info or not info.get('url'):
-            raise ValueError(f"Could not extract playable stream from Facebook URL: {url}")
-
-        return [ResolvedTrack(
-            title=info.get('title', 'Facebook Video Audio'),
-            webpage_url=info.get('webpage_url', url),
-            stream_url=info['url'],
-            duration=int(info.get('duration', 0) or 0),
-            thumbnail=info.get('thumbnail'),
-            uploader=info.get('uploader', 'Facebook User'),
-            source_platform="facebook",
-            trace_id=trace_id
-        )]
 
     @trace_and_log(platform_name="telegram", extract_url_arg="url")
     async def resolve_telegram(self, url: str, trace_id: str) -> List[ResolvedTrack]:
@@ -315,15 +320,17 @@ class UnifiedAudioResolver:
 
         query_or_url = query_or_url.strip()
 
-        if self.YOUTUBE_VIDEO_RE.search(query_or_url) or "youtube.com" in query_or_url or "youtu.be" in query_or_url:
-            return await self.resolve_youtube(query_or_url, trace_id=trace_id)
+        # Route by explicit domain matching first to prevent false regex cross-matches
+        if self.FACEBOOK_RE.search(query_or_url):
+            return await self.resolve_facebook(query_or_url, trace_id=trace_id)
         elif self.SOUNDCLOUD_RE.search(query_or_url):
             return await self.resolve_soundcloud(query_or_url, trace_id=trace_id)
-        elif self.FACEBOOK_RE.search(query_or_url):
-            return await self.resolve_facebook(query_or_url, trace_id=trace_id)
         elif self.TELEGRAM_RE.search(query_or_url):
             return await self.resolve_telegram(query_or_url, trace_id=trace_id)
         elif self.GDRIVE_RE.search(query_or_url):
             return await self.resolve_gdrive(query_or_url, trace_id=trace_id)
+        elif "youtube.com" in query_or_url or "youtu.be" in query_or_url:
+            return await self.resolve_youtube(query_or_url, trace_id=trace_id)
         else:
+            # Fallback to YouTube natural language search
             return await self.resolve_youtube(query_or_url, trace_id=trace_id)
