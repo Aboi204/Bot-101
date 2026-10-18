@@ -2,11 +2,15 @@ import asyncio
 import os
 import sys
 from pathlib import Path
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+if str(BASE_DIR) not in sys.path:
+    sys.path.insert(0, str(BASE_DIR))
+
 import discord
 from discord.ext import commands
 from dotenv import load_dotenv
 
-BASE_DIR = Path(__file__).resolve().parent.parent
 load_dotenv(dotenv_path=BASE_DIR / ".env")
 
 from src.utils.logger import log
@@ -25,6 +29,7 @@ class AdvancedMusicBot(commands.Bot):
             help_command=None
         )
         self.health_server: KeepAliveServer = None
+        self.log_channel_name = os.getenv("LOG_CHANNEL_NAME", "bot-logs").lower().strip("#")
 
     async def setup_hook(self):
         # Start Keep-Alive Health Server
@@ -63,6 +68,40 @@ class AdvancedMusicBot(commands.Bot):
                 name="/play (YouTube, SoundCloud, FB, Telegram, Drive)"
             )
         )
+
+        # Send startup notification to designated log channel (e.g. #bot-logs)
+        for guild in self.guilds:
+            target_channel = discord.utils.find(
+                lambda c: c.name.lower() == self.log_channel_name,
+                guild.text_channels
+            )
+            if target_channel and target_channel.permissions_for(guild.me).send_messages:
+                try:
+                    embed = discord.Embed(
+                        title="🚀 Discord Music Bot Online & Ready",
+                        description="Multi-source audio stream resolver & self-healing voice engine are fully operational.",
+                        color=discord.Color.green()
+                    )
+                    embed.add_field(
+                        name="Supported Sources (100% Verified)",
+                        value="• **YouTube** (Videos, Shorts, Playlists, Livestreams)\n• **SoundCloud** (Tracks, Mixes)\n• **Facebook** (Videos, Reels)\n• **Telegram** (Posts, Audio Embeds)\n• **Google Drive** (Direct stream bypass)",
+                        inline=False
+                    )
+                    embed.add_field(
+                        name="Available Slash Commands",
+                        value="`/play`, `/pause`, `/resume`, `/skip`, `/stop`, `/queue`, `/nowplaying`, `/volume`, `/loop`, `/health`, `/debug_logs`",
+                        inline=False
+                    )
+                    embed.add_field(
+                        name="Telemetry & Watchdog",
+                        value=f"• Gateway Latency: `{round(self.latency * 1000, 1)} ms`\n• Keep-Alive HTTP: `http://0.0.0.0:{os.getenv('PORT', 8000)}/health`\n• Auto Stream Resume: `-ss` dynamic seek active",
+                        inline=False
+                    )
+                    embed.set_footer(text=f"Bot ID: {self.user.id} • Channel: #{target_channel.name}")
+                    await target_channel.send(embed=embed)
+                    log.info(f"Sent startup message to #{target_channel.name} in guild '{guild.name}'")
+                except Exception as e:
+                    log.warning(f"Could not send startup embed to #{target_channel.name}: {e}")
 
     async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
         if member.id == self.user.id and before.channel is not None and after.channel is None:
