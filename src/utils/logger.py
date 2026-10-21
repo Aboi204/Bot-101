@@ -1,6 +1,7 @@
 import asyncio
 import functools
 import inspect
+import io
 import json
 import logging
 import os
@@ -13,9 +14,21 @@ from logging.handlers import RotatingFileHandler
 from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
+# Prevent NoneType AttributeError in --noconsole GUI mode
+if sys.stdout is None:
+    sys.stdout = io.StringIO()
+if sys.stderr is None:
+    sys.stderr = io.StringIO()
+
 # Ensure directories exist
-BASE_DIR = Path(__file__).resolve().parent.parent.parent
-LOGS_DIR = BASE_DIR / "logs"
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys._MEIPASS)
+    APP_DIR = Path(sys.executable).resolve().parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent.parent.parent
+    APP_DIR = BASE_DIR
+
+LOGS_DIR = APP_DIR / "logs"
 LOGS_DIR.mkdir(parents=True, exist_ok=True)
 
 ACTIVITY_LOG_FILE = LOGS_DIR / "bot_activity.log"
@@ -81,6 +94,20 @@ def setup_activity_logger(name: str = "discord_music_bot") -> logging.Logger:
     return logger
 
 log = setup_activity_logger()
+
+def add_gui_log_handler(callback):
+    """Registers a callback(formatted_msg, levelno) to receive logs in the GUI."""
+    class GuiLogHandler(logging.Handler):
+        def emit(self, record):
+            try:
+                msg = self.format(record)
+                callback(msg, record.levelno)
+            except Exception:
+                pass
+
+    gui_handler = GuiLogHandler()
+    gui_handler.setFormatter(BotActivityFormatter(use_color=False))
+    log.addHandler(gui_handler)
 
 def record_error_trace(
     trace_id: str,
@@ -163,8 +190,18 @@ def trace_and_log(
         if inspect.iscoroutinefunction(func):
             @functools.wraps(func)
             async def async_wrapper(*args, **kwargs):
-                trace_id = kwargs.get("trace_id") or generate_trace_id()
-                kwargs["trace_id"] = trace_id
+                sig = inspect.signature(func)
+                try:
+                    bound = sig.bind_partial(*args, **kwargs)
+                    if "trace_id" in bound.arguments and bound.arguments["trace_id"]:
+                        trace_id = bound.arguments["trace_id"]
+                    else:
+                        trace_id = kwargs.get("trace_id") or generate_trace_id()
+                        if "trace_id" in sig.parameters and "trace_id" not in bound.arguments:
+                            kwargs["trace_id"] = trace_id
+                except Exception:
+                    trace_id = kwargs.get("trace_id") or generate_trace_id()
+                    kwargs["trace_id"] = trace_id
                 t0 = time.time()
                 func_name = func.__name__
                 input_url = kwargs.get(extract_url_arg) if extract_url_arg else None
@@ -199,8 +236,18 @@ def trace_and_log(
         else:
             @functools.wraps(func)
             def sync_wrapper(*args, **kwargs):
-                trace_id = kwargs.get("trace_id") or generate_trace_id()
-                kwargs["trace_id"] = trace_id
+                sig = inspect.signature(func)
+                try:
+                    bound = sig.bind_partial(*args, **kwargs)
+                    if "trace_id" in bound.arguments and bound.arguments["trace_id"]:
+                        trace_id = bound.arguments["trace_id"]
+                    else:
+                        trace_id = kwargs.get("trace_id") or generate_trace_id()
+                        if "trace_id" in sig.parameters and "trace_id" not in bound.arguments:
+                            kwargs["trace_id"] = trace_id
+                except Exception:
+                    trace_id = kwargs.get("trace_id") or generate_trace_id()
+                    kwargs["trace_id"] = trace_id
                 t0 = time.time()
                 func_name = func.__name__
                 input_url = kwargs.get(extract_url_arg) if extract_url_arg else None

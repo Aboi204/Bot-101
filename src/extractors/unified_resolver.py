@@ -2,6 +2,7 @@ import asyncio
 import html
 import os
 import re
+import sys
 import urllib.parse
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,9 +13,26 @@ import yt_dlp
 
 from src.utils.logger import log, record_error_trace, trace_and_log
 
-BASE_DIR = Path(__file__).resolve().parent.parent.parent
-COOKIES_FILE = BASE_DIR / "cookies" / "cookies.txt"
-CACHE_AUDIO_DIR = BASE_DIR / "cache" / "audio"
+if getattr(sys, "frozen", False):
+    BASE_DIR = Path(sys._MEIPASS)
+    APP_DIR = Path(sys.executable).resolve().parent
+else:
+    BASE_DIR = Path(__file__).resolve().parent.parent.parent
+    APP_DIR = BASE_DIR
+
+def _get_active_cookie_file() -> Path:
+    candidates = [
+        APP_DIR / "cookies" / "cookies.txt",
+        APP_DIR / "cookies.txt",
+        BASE_DIR / "cookies" / "cookies.txt",
+    ]
+    for c in candidates:
+        if c.is_file():
+            return c
+    return BASE_DIR / "cookies" / "cookies.txt"
+
+COOKIES_FILE = _get_active_cookie_file()
+CACHE_AUDIO_DIR = APP_DIR / "cache" / "audio"
 CACHE_AUDIO_DIR.mkdir(parents=True, exist_ok=True)
 
 @dataclass
@@ -77,12 +95,54 @@ class UnifiedAudioResolver:
         if self.cookie_path and os.path.exists(self.cookie_path) and os.path.getsize(self.cookie_path) > 100:
             opts['cookiefile'] = self.cookie_path
 
-        if platform_type == "facebook":
+        if platform_type == "youtube":
+            opts['extractor_args'] = {
+                'youtube': {
+                    'player_client': ['android', 'ios', 'web'],
+                }
+            }
+        elif platform_type == "facebook":
             # HD video audio stream selection for crystal-clear quality
             opts['format'] = 'hd/best[ext=mp4]/bestaudio/best'
         elif platform_type in ("telegram", "gdrive"):
             opts['format'] = 'best[ext=mp4]/bestaudio/best'
         return opts
+
+    async def _extract_facebook_embed(self, url: str, trace_id: str) -> Optional[ResolvedTrack]:
+        """Bypasses Facebook login walls by querying the public embed endpoint directly."""
+        embed_url = f"https://www.facebook.com/plugins/video.php?href={urllib.parse.quote(url)}"
+        headers = {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-US,en;q=0.9",
+        }
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.get(embed_url, headers=headers, timeout=aiohttp.ClientTimeout(total=10)) as resp:
+                    if resp.status == 200:
+                        html_text = await resp.text()
+                        hd = re.findall(r'hd_src_no_ratelimit:"([^"]+)"', html_text) or re.findall(r'"hd_src":"([^"]+)"', html_text)
+                        sd = re.findall(r'sd_src_no_ratelimit:"([^"]+)"', html_text) or re.findall(r'"sd_src":"([^"]+)"', html_text)
+                        target = hd[0] if hd else (sd[0] if sd else None)
+                        if target:
+                            stream_url = target.replace(r"\/", "/").replace(r"\u0025", "%")
+                            title_match = re.search(r'<title>([^<]+)</title>', html_text)
+                            title = title_match.group(1).strip() if title_match else "Facebook Video Audio"
+                            if "Facebook" in title and "|" in title:
+                                title = title.split("|", 1)[1].strip()
+                            return ResolvedTrack(
+                                title=title[:100],
+                                webpage_url=url,
+                                stream_url=stream_url,
+                                duration=0,
+                                thumbnail=None,
+                                uploader="Facebook",
+                                source_platform="facebook",
+                                trace_id=trace_id
+                            )
+        except Exception as e:
+            log.warning(f"Facebook embed fallback scraper failed: {e}", extra={"trace_id": trace_id})
+        return None
 
     @trace_and_log(platform_name="facebook", extract_url_arg="url")
     async def resolve_facebook(self, url: str, trace_id: str) -> List[ResolvedTrack]:
@@ -93,8 +153,21 @@ class UnifiedAudioResolver:
             with yt_dlp.YoutubeDL(opts) as ydl:
                 return ydl.extract_info(url, download=False)
 
-        info = await loop.run_in_executor(None, _extract)
+        info = None
+        try:
+            info = await loop.run_in_executor(None, _extract)
+        except Exception as e:
+            log.warning(f"yt-dlp Facebook extractor failed ({e}), attempting embed bypass fallback...", extra={"trace_id": trace_id})
+            fallback_track = await self._extract_facebook_embed(url, trace_id)
+            if fallback_track:
+                log.info(f"Successfully bypassed Facebook login wall via embed player: {fallback_track.title}", extra={"trace_id": trace_id})
+                return [fallback_track]
+            raise e
+
         if not info or not info.get('url'):
+            fallback_track = await self._extract_facebook_embed(url, trace_id)
+            if fallback_track:
+                return [fallback_track]
             raise ValueError(f"Could not extract playable stream from Facebook URL: {url}")
 
         raw_title = info.get('title') or 'Facebook Video Audio'
@@ -280,8 +353,11 @@ class UnifiedAudioResolver:
         candidates = [
             f"https://t.me/{clean_channel}/{msg_id}?embed=1",
             f"https://t.me/s/{clean_channel}/{msg_id}",
-            f"https://t.me/{clean_channel}/{msg_id}",
         ]
+        if msg_id.isdigit():
+            candidates.append(f"https://t.me/s/{clean_channel}?before={int(msg_id) + 1}")
+        candidates.append(f"https://t.me/{clean_channel}/{msg_id}")
+
         if match and match.group(1):  # c/<channel_id>/<msg_id> format
             candidates.insert(0, f"https://t.me/c/{clean_channel}/{msg_id}?embed=1")
 
@@ -291,6 +367,7 @@ class UnifiedAudioResolver:
             "Accept-Language": "ar,en-US;q=0.9,en;q=0.8"
         }
 
+        detected_too_big = False
         async with aiohttp.ClientSession(headers=headers) as session:
             for cand_url in candidates:
                 try:
@@ -299,12 +376,31 @@ class UnifiedAudioResolver:
                             continue
                         html_text = await resp.text()
 
-                        # Extract media source from video/audio/source tags or telescope links
-                        media_matches = re.findall(r'<(?:audio|video|source)[^>]+src=["\']([^"\']+)["\']', html_text)
+                        # Strictly locate the message element matching msg_id
+                        post_pattern = rf'data-post=["\'][^"\']*/{msg_id}["\']'
+                        post_match = re.search(post_pattern, html_text)
+                        if post_match:
+                            start_pos = post_match.start()
+                            next_post = re.search(r'data-post=["\']', html_text[post_match.end():])
+                            if next_post:
+                                target_chunk = html_text[start_pos : post_match.end() + next_post.start()]
+                            else:
+                                target_chunk = html_text[start_pos:]
+                        elif "embed=1" in cand_url:
+                            target_chunk = html_text
+                        else:
+                            # Not present on this multi-message page, try next candidate
+                            continue
+
+                        if "Media is too big" in target_chunk or "message_media_not_supported" in target_chunk:
+                            detected_too_big = True
+
+                        # Extract media source strictly from this post's chunk
+                        media_matches = re.findall(r'<(?:audio|video|source)[^>]+src=["\']([^"\']+)["\']', target_chunk)
                         if not media_matches:
                             media_matches = re.findall(
                                 r'https?://[a-zA-Z0-9_\.]*telesco\.pe/file/[^\s"\'<>]+\.(?:mp4|mp3|ogg|m4a|wav|opus)[^\s"\'<>]*',
-                                html_text
+                                target_chunk
                             )
 
                         if media_matches:
@@ -312,24 +408,24 @@ class UnifiedAudioResolver:
                             if stream_src.startswith("/"):
                                 stream_src = f"https://t.me{stream_src}"
 
-                            # Extract channel owner / uploader name
+                            # Extract channel owner / uploader name from target chunk or page
                             author_match = re.search(
                                 r'class=["\']tgme_widget_message_owner_name[^\"]*["\'][^>]*><span[^>]*>(.*?)</span>',
-                                html_text,
+                                target_chunk,
                                 re.DOTALL
                             )
                             author = html.unescape(re.sub(r'<[^>]+>', '', author_match.group(1)).strip()) if author_match else f"@{clean_channel}"
 
-                            # Extract caption/text
+                            # Extract caption/text from target chunk
                             caption_match = re.search(
                                 r'class=["\']tgme_widget_message_text[^\"]*["\'][^>]*>(.*?)</div>',
-                                html_text,
+                                target_chunk,
                                 re.DOTALL
                             )
                             caption = html.unescape(re.sub(r'<[^>]+>', '', caption_match.group(1)).strip()) if caption_match else None
 
-                            # Extract duration
-                            dur_match = re.search(r'class=["\']message_video_duration[^\"]*["\'][^>]*>([0-9:]+)</time>', html_text)
+                            # Extract duration from target chunk
+                            dur_match = re.search(r'class=["\']message_video_duration[^\"]*["\'][^>]*>([0-9:]+)</time>', target_chunk)
                             duration = 0
                             if dur_match:
                                 parts = list(map(int, dur_match.group(1).split(':')))
@@ -338,10 +434,10 @@ class UnifiedAudioResolver:
                                 elif len(parts) == 3:
                                     duration = parts[0] * 3600 + parts[1] * 60 + parts[2]
 
-                            # Extract thumbnail
+                            # Extract thumbnail from target chunk
                             thumb_match = re.search(
                                 r'class=["\'][^"\']*(?:video_thumb|photo_thumb)[^"\']*["\'][^>]*style=["\']background-image:url\([\'"]?([^\'")]+)[\'"]?\)',
-                                html_text
+                                target_chunk
                             )
                             thumbnail = thumb_match.group(1) if thumb_match else None
 
@@ -361,10 +457,15 @@ class UnifiedAudioResolver:
                     log.debug(f"Telegram candidate {cand_url} failed: {ex}")
                     continue
 
+        if detected_too_big:
+            raise ValueError(
+                f"مقطع تيليجرام ({clean_channel}/{msg_id}) حجمه كبير ويتطلب تنزيلاً في التطبيق (Media is too big). "
+                f"سيرفرات تيليجرام تحظر بث الملفات الكبيرة عبر الويب وتسمح فقط بالصوتيات ومقاطع المعاينة المباشرة."
+            )
+
         raise ValueError(
-            f"مقطع تيليجرام ({clean_channel}/{msg_id}) غير متاح للبث المباشر عبر المعاينة العامة. "
-            f"قد يكون المقطع بتنسيق غير مدعوم على متصفح الويب أو يتجاوز الحجم المسموح. "
-            f"جرب مقطعاً آخر من القناة متاحاً للمعاينة (مثل #{int(msg_id) + 1 if msg_id.isdigit() else 'المقاطع الأخرى'})."
+            f"مقطع تيليجرام ({clean_channel}/{msg_id}) لا يحتوي على فيديو أو مقطع صوتي متاح للبث المباشر. "
+            f"تأكد من أن الرابط يشير إلى رسالة تحتوي على ملف فيديو أو صوت متاح للمعاينة."
         )
 
     @trace_and_log(platform_name="google_drive", extract_url_arg="url")

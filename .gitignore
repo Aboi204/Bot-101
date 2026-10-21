@@ -1,8 +1,12 @@
 # Environment & Secrets
 .env
-.env.local
+.env.*
+!.env.example
+*.env
 cookies/cookies.txt
 *.cookies
+*.session
+*.session-journal
 
 # Python
 __pycache__/
@@ -14,6 +18,19 @@ env/
 venv/
 ENV/
 
+# Build & Dist Artifacts
+build/
+dist/
+*.exe
+*.xz
+*.zip
+*.spec
+
+# Personal, Scratch, and Temporary Files
+*.pdf
+New Text Document*.txt
+README_*.txt
+
 # Caches & Logs
 cache/audio/*
 !cache/audio/.gitkeep
@@ -21,3 +38,4 @@ logs/*
 !logs/.gitkeep
 *.log
 *.tmp
+.DS_Store

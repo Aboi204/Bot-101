@@ -1,3 +1,4 @@
+import asyncio
 import datetime
 import json
 import os
@@ -19,7 +20,7 @@ from src.utils.logger import (
     trace_and_log,
 )
 from src.utils.voice_manager import GuildVoiceManager, LoopMode
-from src.utils.ui_controls import MusicControlView, build_now_playing_embed, create_progress_bar
+from src.utils.ui_controls import MusicControlView, build_now_playing_embed
 
 class MusicCog(commands.Cog, name="Music"):
     """Multi-source music streaming commands and diagnostic telemetry."""
@@ -37,7 +38,11 @@ class MusicCog(commands.Cog, name="Music"):
 
     async def _ensure_voice(self, interaction: discord.Interaction) -> Optional[discord.VoiceClient]:
         if not interaction.user.voice or not interaction.user.voice.channel:
-            await interaction.response.send_message("❌ You must be connected to a voice channel.", ephemeral=True)
+            msg = "❌ يجب أن تكون متواجداً في روم صوتي أولاً لدعوة وتشغيل البوت."
+            if not interaction.response.is_done():
+                await interaction.response.send_message(msg, ephemeral=True)
+            else:
+                await interaction.followup.send(msg, ephemeral=True)
             return None
 
         channel = interaction.user.voice.channel
@@ -56,9 +61,54 @@ class MusicCog(commands.Cog, name="Music"):
 
         return vc
 
+    @commands.Cog.listener()
+    async def on_voice_state_update(self, member: discord.Member, before: discord.VoiceState, after: discord.VoiceState):
+        """Auto-disconnects the bot when the voice channel becomes empty."""
+        if self.bot.user and member.id == self.bot.user.id:
+            return
+
+        guild = member.guild
+        vc = guild.voice_client
+        if not vc or not vc.channel:
+            return
+
+        # Check if a user left the channel where the bot is connected
+        if before.channel == vc.channel and after.channel != vc.channel:
+            non_bot_members = [m for m in vc.channel.members if not m.bot]
+            if len(non_bot_members) == 0:
+                log.info(f"Voice channel {vc.channel.name} is now empty. Waiting 3s grace check.")
+                await asyncio.sleep(3)
+                if vc.is_connected() and vc.channel:
+                    remaining = [m for m in vc.channel.members if not m.bot]
+                    if len(remaining) == 0:
+                        log.info(f"All members left voice channel in guild {guild.id}. Auto-disconnecting bot.")
+                        manager = self.get_manager(guild)
+                        manager.stop()
+                        if manager.text_channel:
+                            try:
+                                await manager.text_channel.send("👋 تم الخروج من الروم الصوتي تلقائياً لمغادرة جميع الأعضاء.")
+                            except Exception:
+                                pass
+                        await vc.disconnect(force=True)
+                        await manager.update_now_playing_message()
+
+    @app_commands.command(name="join", description="Connect the bot to your current voice channel")
+    async def join_cmd(self, interaction: discord.Interaction):
+        if not interaction.user.voice or not interaction.user.voice.channel:
+            await interaction.response.send_message("❌ يجب أن تكون متواجداً في روم صوتي أولاً لدعوة البوت.", ephemeral=True)
+            return
+
+        vc = await self._ensure_voice(interaction)
+        if vc and vc.channel:
+            await interaction.response.send_message(f"🔊 انضم البوت إلى **{vc.channel.name}** بنجاح.", ephemeral=True)
+
     @app_commands.command(name="play", description="Stream audio from YouTube, SoundCloud, Facebook, Telegram, or Google Drive")
     @app_commands.describe(query="Song title, search keywords, or URL (YouTube, SoundCloud, Facebook, Telegram, Drive)")
     async def play(self, interaction: discord.Interaction, query: str):
+        if not interaction.user.voice or not interaction.user.voice.channel:
+            await interaction.response.send_message("❌ يجب أن تكون متواجداً في روم صوتي أولاً لتشغيل البوت.", ephemeral=True)
+            return
+
         trace_id = generate_trace_id()
         await interaction.response.defer()
 
@@ -81,6 +131,8 @@ class MusicCog(commands.Cog, name="Music"):
             return
 
         manager.enqueue_multiple(tracks)
+        if manager.current_message:
+            asyncio.create_task(manager.update_now_playing_message())
 
         if len(tracks) == 1:
             track = tracks[0]
@@ -112,6 +164,8 @@ class MusicCog(commands.Cog, name="Music"):
             await interaction.response.send_message("❌ Nothing is currently playing.", ephemeral=True)
             return
         manager.pause()
+        if manager.current_message:
+            asyncio.create_task(manager.update_now_playing_message())
         await interaction.response.send_message("⏸️ Playback paused.")
 
     @app_commands.command(name="resume", description="Resume paused audio playback")
@@ -121,6 +175,8 @@ class MusicCog(commands.Cog, name="Music"):
             await interaction.response.send_message("❌ Playback is not paused.", ephemeral=True)
             return
         manager.resume()
+        if manager.current_message:
+            asyncio.create_task(manager.update_now_playing_message())
         await interaction.response.send_message("▶️ Playback resumed.")
 
     @app_commands.command(name="skip", description="Skip to the next song in the queue")
@@ -146,26 +202,42 @@ class MusicCog(commands.Cog, name="Music"):
             await interaction.response.send_message("❌ Nothing is currently playing.", ephemeral=True)
             return
 
-        embed = build_now_playing_embed(manager)
-        view = MusicControlView(manager)
-        await interaction.response.send_message(embed=embed, view=view)
+        manager.text_channel = interaction.channel
+        await manager.update_now_playing_message(force_new=True)
+        await interaction.response.send_message("🎛️ Live dashboard updated.", ephemeral=True)
 
-    @app_commands.command(name="queue", description="Display the list of upcoming songs with interactive controls")
+    @app_commands.command(name="queue", description="Display the list of upcoming songs")
     async def queue_cmd(self, interaction: discord.Interaction):
         manager = self.get_manager(interaction.guild)
         if not manager.current and not manager.queue:
             await interaction.response.send_message("📭 Queue is currently empty.", ephemeral=True)
             return
 
-        embed = build_now_playing_embed(manager)
-        view = MusicControlView(manager)
-        await interaction.response.send_message(embed=embed, view=view)
+        lines = []
+        if manager.current:
+            lines.append(f"**Now Playing:** [{manager.current.title}]({manager.current.webpage_url}) (`{manager.current.formatted_duration}`)\n")
+        
+        if manager.queue:
+            lines.append("**Upcoming Tracks:**")
+            for idx, track in enumerate(list(manager.queue)[:15], start=1):
+                lines.append(f"`{idx}.` [{track.title[:50]}]({track.webpage_url}) (`{track.formatted_duration}`)")
+            if len(manager.queue) > 15:
+                lines.append(f"\n*...and {len(manager.queue) - 15} more tracks in queue*")
+
+        embed = discord.Embed(
+            title="📜 Current Playback Queue",
+            description="\n".join(lines),
+            color=discord.Color.blurple()
+        )
+        await interaction.response.send_message(embed=embed)
 
     @app_commands.command(name="volume", description="Set playback volume between 1% and 200%")
     @app_commands.describe(percent="Volume percentage (1-200)")
     async def volume_cmd(self, interaction: discord.Interaction, percent: app_commands.Range[int, 1, 200]):
         manager = self.get_manager(interaction.guild)
         manager.set_volume(percent)
+        if manager.current_message:
+            asyncio.create_task(manager.update_now_playing_message())
         await interaction.response.send_message(f"🔊 Volume adjusted to **{percent}%**")
 
     @app_commands.command(name="loop", description="Configure loop mode")
@@ -173,7 +245,20 @@ class MusicCog(commands.Cog, name="Music"):
     async def loop_cmd(self, interaction: discord.Interaction, mode: Literal["off", "track", "queue"]):
         manager = self.get_manager(interaction.guild)
         manager.loop_mode = LoopMode(mode)
+        if manager.current_message:
+            asyncio.create_task(manager.update_now_playing_message())
         await interaction.response.send_message(f"🔁 Loop mode set to: **{mode.title()}**")
+
+    @app_commands.command(name="shuffle", description="Randomly shuffle all tracks currently in the queue")
+    async def shuffle_cmd(self, interaction: discord.Interaction):
+        manager = self.get_manager(interaction.guild)
+        count = manager.shuffle_queue()
+        if count == 0:
+            await interaction.response.send_message("⚠️ Queue is currently empty, nothing to shuffle.", ephemeral=True)
+            return
+        if manager.current_message:
+            asyncio.create_task(manager.update_now_playing_message())
+        await interaction.response.send_message(f"🔀 Successfully shuffled **{count}** tracks in the queue!")
 
     @app_commands.command(name="health", description="Display real-time system and bot health metrics")
     async def health(self, interaction: discord.Interaction):
